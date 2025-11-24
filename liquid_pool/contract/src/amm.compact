@@ -1,0 +1,195 @@
+pragma language_version 0.17.0;
+
+import CompactStandardLibrary;
+
+// =============================================================================
+// CONSTANT PRODUCT AMM (x·y = k)
+// =============================================================================
+// 
+// Core Formula: x * y = k (invariant must be preserved)
+// 
+// Swap Formula:
+//   Given input Δx, output is: Δy = y - (k / (x + Δx))
+//   Simplified: Δy = (y * Δx) / (x + Δx)
+//
+// Liquidity Formula:
+//   LP tokens = √(Δx * Δy) (approximated as min for simplicity)
+//   Share ratio = LP / totalSupply
+//
+// Note: Vì Compact không hỗ trợ division trong circuits,
+//       chúng ta sẽ verify công thức thay vì tính toán trực tiếp
+// =============================================================================
+
+export ledger poolA_reserve: Counter;
+export ledger poolB_reserve: Counter;
+export ledger lp_totalSupply: Counter;
+
+// -----------------------------------------------------------------------------
+// CREATE POOL: Initialize với liquidity đầu tiên
+// LP tokens = √(amountA * amountB)
+// User tính sqrt ở off-chain, contract verify: lpAmount² ≈ amountA * amountB
+// -----------------------------------------------------------------------------
+export circuit createPool(
+  amountA: Uint<16>, 
+  amountB: Uint<16>,
+  lpAmount: Uint<16>  // User tính sqrt(amountA * amountB) ở off-chain
+): [] {
+  // Chỉ được gọi khi pool rỗng
+  const currentSupply = lp_totalSupply.read();
+  assert(currentSupply == 0, "Pool already initialized");
+  
+  // Verify lpAmount ≈ sqrt(amountA * amountB)
+  // lpAmount² should equal amountA * amountB
+  const lpSquared = disclose(lpAmount) * disclose(lpAmount);
+  const product = disclose(amountA) * disclose(amountB);
+  
+  // Verify lpAmount² is close to product (allow ±1 for rounding)
+  // We check: product - 1 <= lpSquared <= product + 1
+  const lowerBound = product > 0 ? product - 1 : 0;
+  const upperBound = product + 1;
+  
+  assert(lpSquared >= lowerBound, "LP amount too small");
+  assert(lpSquared <= upperBound, "LP amount too large");
+  
+  // Add initial liquidity
+  poolA_reserve.increment(disclose(amountA));
+  poolB_reserve.increment(disclose(amountB));
+  lp_totalSupply.increment(disclose(lpAmount));
+}
+
+// -----------------------------------------------------------------------------
+// ADD LIQUIDITY: Thêm liquidity theo tỉ lệ hiện tại
+// Formula: 
+//   ratio = min(amountA/reserveA, amountB/reserveB)
+//   LP minted = totalSupply * ratio
+//
+// Vì không có division, ta verify bằng multiplication:
+//   amountA * totalSupply >= lpMinted * reserveA
+//   amountB * totalSupply >= lpMinted * reserveB
+// -----------------------------------------------------------------------------
+export circuit addLiquidity(
+  amountA: Uint<16>, 
+  amountB: Uint<16>,
+  lpMinted: Uint<16>  // User phải tính trước và pass vào
+): [] {
+  const reserveA = poolA_reserve.read();
+  const reserveB = poolB_reserve.read();
+  const totalSupply = lp_totalSupply.read();
+  
+  // Pool phải đã được initialize
+  assert(totalSupply > 0, "Pool not initialized");
+  
+  // Verify tỉ lệ add liquidity đúng (dùng multiplication thay cho division)
+  // Condition: lpMinted <= min(amountA*totalSupply/reserveA, amountB*totalSupply/reserveB)
+  // Equivalent: lpMinted*reserveA <= amountA*totalSupply && lpMinted*reserveB <= amountB*totalSupply
+  const checkA = disclose(lpMinted) * reserveA;
+  const checkB = disclose(lpMinted) * reserveB;
+  const requiredA = disclose(amountA) * totalSupply;
+  const requiredB = disclose(amountB) * totalSupply;
+  
+  assert(checkA <= requiredA, "Insufficient amountA for desired LP");
+  assert(checkB <= requiredB, "Insufficient amountB for desired LP");
+  
+  // Update reserves
+  poolA_reserve.increment(disclose(amountA));
+  poolB_reserve.increment(disclose(amountB));
+  lp_totalSupply.increment(disclose(lpMinted));
+}
+
+// -----------------------------------------------------------------------------
+// REMOVE LIQUIDITY: Rút liquidity theo LP share
+// Formula:
+//   amountA = reserveA * lpBurned / totalSupply
+//   amountB = reserveB * lpBurned / totalSupply
+//
+// Verify: lpBurned * reserveA = amountA * totalSupply
+// -----------------------------------------------------------------------------
+export circuit removeLiquidity(
+  lpBurned: Uint<16>,
+  amountA: Uint<16>,  // User tính trước dựa trên share
+  amountB: Uint<16>
+): [] {
+  const reserveA = poolA_reserve.read();
+  const reserveB = poolB_reserve.read();
+  const totalSupply = lp_totalSupply.read();
+  
+  assert(totalSupply >= disclose(lpBurned), "Insufficient LP supply");
+  
+  // Verify amounts đúng theo tỉ lệ share
+  // amountA = reserveA * lpBurned / totalSupply
+  // => amountA * totalSupply = reserveA * lpBurned
+  const checkA = disclose(amountA) * totalSupply;
+  const checkB = disclose(amountB) * totalSupply;
+  const expectedA = reserveA * disclose(lpBurned);
+  const expectedB = reserveB * disclose(lpBurned);
+  
+  assert(checkA == expectedA, "Invalid amountA calculation");
+  assert(checkB == expectedB, "Invalid amountB calculation");
+  
+  // Update reserves
+  poolA_reserve.decrement(disclose(amountA));
+  poolB_reserve.decrement(disclose(amountB));
+  lp_totalSupply.decrement(disclose(lpBurned));
+}
+
+// -----------------------------------------------------------------------------
+// SWAP A → B: Constant product formula
+// Formula:
+//   k = x * y
+//   output = y - (k / (x + input))
+//   output = (y * input) / (x + input)
+//
+// Verify k invariant:
+//   (x + input) * (y - output) >= x * y
+// -----------------------------------------------------------------------------
+export circuit swapAforB(
+  inputAmount: Uint<16>,
+  outputAmount: Uint<16>,  // User tính trước theo formula
+  minOutput: Uint<16>       // Slippage protection
+): [] {
+  const reserveA = poolA_reserve.read();
+  const reserveB = poolB_reserve.read();
+  
+  // Slippage check
+  assert(disclose(outputAmount) >= disclose(minOutput), "Slippage too high");
+  
+  // Verify constant product invariant: (x+Δx)(y-Δy) >= xy
+  // Thực tế nên dùng = nhưng vì rounding ta dùng >=
+  const k_before = reserveA * reserveB;
+  const newReserveA = reserveA + disclose(inputAmount);
+  const newReserveB = reserveB - disclose(outputAmount);
+  const k_after = newReserveA * newReserveB;
+  
+  assert(k_after >= k_before, "Constant product invariant violated");
+  
+  // Update reserves
+  poolA_reserve.increment(disclose(inputAmount));
+  poolB_reserve.decrement(disclose(outputAmount));
+}
+
+// -----------------------------------------------------------------------------
+// SWAP B → A: Constant product formula (reverse direction)
+// -----------------------------------------------------------------------------
+export circuit swapBforA(
+  inputAmount: Uint<16>,
+  outputAmount: Uint<16>,
+  minOutput: Uint<16>
+): [] {
+  const reserveA = poolA_reserve.read();
+  const reserveB = poolB_reserve.read();
+  
+  // Slippage check
+  assert(disclose(outputAmount) >= disclose(minOutput), "Slippage too high");
+  
+  // Verify constant product invariant
+  const k_before = reserveA * reserveB;
+  const newReserveA = reserveA - disclose(outputAmount);
+  const newReserveB = reserveB + disclose(inputAmount);
+  const k_after = newReserveA * newReserveB;
+  
+  assert(k_after >= k_before, "Constant product invariant violated");
+  
+  // Update reserves
+  poolB_reserve.increment(disclose(inputAmount));
+  poolA_reserve.decrement(disclose(outputAmount));
+}
